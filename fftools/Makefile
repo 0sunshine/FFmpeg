@@ -1,11 +1,11 @@
-AVPROGS-$(CONFIG_FFMPEG)   += ffmpeg
+AVPROGS-$(CONFIG_FFMPEG)   += transcode
 AVPROGS-$(CONFIG_FFPLAY)   += ffplay
 AVPROGS-$(CONFIG_FFPROBE)  += ffprobe
 
 AVPROGS     := $(AVPROGS-yes:%=%$(PROGSSUF)$(EXESUF))
 PROGS       += $(AVPROGS)
 
-AVBASENAMES  = ffmpeg ffplay ffprobe
+AVBASENAMES  = transcode ffplay ffprobe
 ALLAVPROGS   = $(AVBASENAMES:%=%$(PROGSSUF)$(EXESUF))
 ALLAVPROGS_G = $(AVBASENAMES:%=%$(PROGSSUF)_g$(EXESUF))
 
@@ -52,10 +52,13 @@ OBJS-ffprobe +=                       \
     fftools/textformat/tw_stdout.o    \
 
 OBJS-ffmpeg += $(COMPAT_OBJS:%=compat/%)
+OBJS-transcode += $(OBJS-ffmpeg)
 OBJS-ffplay += fftools/ffplay_renderer.o
 
+TOOL_MAIN-transcode = ffmpeg
+
 define DOFFTOOL
-OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)
+OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(or $(TOOL_MAIN-$(1)),$(1)).o $(OBJS-$(1)-yes)
 ifdef HAVE_GNU_WINDRES
 OBJS-$(1) += fftools/fftoolsres.o
 endif

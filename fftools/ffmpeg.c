@@ -25,6 +25,7 @@
 
 #include "config.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdatomic.h>
@@ -68,8 +69,12 @@
 #include <conio.h>
 #endif
 
+#include "libavutil/aes.h"
+#include "libavutil/base64.h"
 #include "libavutil/bprint.h"
 #include "libavutil/dict.h"
+#include "libavutil/error.h"
+#include "libavutil/file.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
@@ -86,7 +91,7 @@
 #include "ffmpeg_utils.h"
 #include "graph/graphprint.h"
 
-const char program_name[] = "ffmpeg";
+const char program_name[] = "transcode";
 const int program_birth_year = 2000;
 
 FILE *vstats_file;
@@ -101,6 +106,293 @@ static BenchmarkTimeStamps get_benchmark_time_stamps(void);
 static int64_t getmaxrss(void);
 
 atomic_uint nb_output_dumped = 0;
+
+typedef struct SecureConfigArgv {
+    char **argv;
+    char **owned;
+    int argc;
+    int allocated;
+    int nb_owned;
+} SecureConfigArgv;
+
+static const uint8_t secure_config_key[16] = {
+    0x74, 0x72, 0x61, 0x6e, 0x73, 0x63, 0x6f, 0x64,
+    0x65, 0x2d, 0x6b, 0x65, 0x79, 0x2d, 0x30, 0x31,
+};
+
+static void secure_config_argv_uninit(SecureConfigArgv *args)
+{
+    for (int i = 0; i < args->nb_owned; i++)
+        av_freep(&args->owned[i]);
+
+    av_freep(&args->owned);
+    av_freep(&args->argv);
+    args->argc = 0;
+    args->allocated = 0;
+    args->nb_owned = 0;
+}
+
+static int secure_config_append_ref(SecureConfigArgv *args, char *arg)
+{
+    char **tmp;
+
+    if (args->argc + 1 >= args->allocated) {
+        int allocated = args->allocated ? args->allocated * 2 : 32;
+
+        tmp = av_realloc_array(args->argv, allocated, sizeof(*args->argv));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+
+        args->argv = tmp;
+        args->allocated = allocated;
+    }
+
+    args->argv[args->argc++] = arg;
+    args->argv[args->argc] = NULL;
+    return 0;
+}
+
+static int secure_config_append_owned(SecureConfigArgv *args, const char *arg)
+{
+    char **tmp;
+    char *owned = av_strdup(arg);
+    int ret;
+
+    if (!owned)
+        return AVERROR(ENOMEM);
+
+    tmp = av_realloc_array(args->owned, args->nb_owned + 1, sizeof(*args->owned));
+    if (!tmp) {
+        av_free(owned);
+        return AVERROR(ENOMEM);
+    }
+
+    args->owned = tmp;
+    args->owned[args->nb_owned++] = owned;
+
+    ret = secure_config_append_ref(args, owned);
+    if (ret < 0)
+        av_freep(&args->owned[--args->nb_owned]);
+
+    return ret;
+}
+
+static char *secure_config_skip_spaces(char *line)
+{
+    while (*line && isspace((unsigned char)*line))
+        line++;
+    return line;
+}
+
+static int secure_config_decrypt(const char *value, char **out)
+{
+    struct AVAES *aes = NULL;
+    uint8_t *decoded = NULL;
+    uint8_t *plain = NULL;
+    uint8_t iv[16];
+    int decoded_size, decoded_len, cipher_len, plain_len, pad;
+    int ret = 0;
+
+    *out = NULL;
+
+    if (strncmp(value, "v1:", 3)) {
+        av_log(NULL, AV_LOG_ERROR, "Unsupported secure config ciphertext format.\n");
+        return AVERROR(EINVAL);
+    }
+    value += 3;
+
+    decoded_size = AV_BASE64_DECODE_SIZE(strlen(value)) + 1;
+    decoded = av_malloc(decoded_size);
+    if (!decoded)
+        return AVERROR(ENOMEM);
+
+    decoded_len = av_base64_decode(decoded, value, decoded_size);
+    if (decoded_len < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Invalid secure config base64 data.\n");
+        ret = decoded_len;
+        goto fail;
+    }
+    if (decoded_len <= 16 || ((decoded_len - 16) & 15)) {
+        av_log(NULL, AV_LOG_ERROR, "Invalid secure config ciphertext size.\n");
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+
+    cipher_len = decoded_len - 16;
+    if (cipher_len > INT_MAX - 1) {
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+
+    plain = av_malloc(cipher_len + 1);
+    aes = av_aes_alloc();
+    if (!plain || !aes) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    memcpy(iv, decoded, sizeof(iv));
+    ret = av_aes_init(aes, secure_config_key, 128, 1);
+    if (ret < 0)
+        goto fail;
+
+    av_aes_crypt(aes, plain, decoded + 16, cipher_len / 16, iv, 1);
+
+    pad = plain[cipher_len - 1];
+    if (pad <= 0 || pad > 16 || pad > cipher_len) {
+        av_log(NULL, AV_LOG_ERROR, "Invalid secure config padding.\n");
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+    for (int i = 0; i < pad; i++) {
+        if (plain[cipher_len - 1 - i] != pad) {
+            av_log(NULL, AV_LOG_ERROR, "Invalid secure config padding.\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+    }
+
+    plain_len = cipher_len - pad;
+    plain[plain_len] = 0;
+    *out = (char *)plain;
+    plain = NULL;
+
+fail:
+    av_free(aes);
+    av_free(decoded);
+    av_free(plain);
+    return ret;
+}
+
+static int secure_config_parse_text(char *text, SecureConfigArgv *args, int allow_encrypted)
+{
+    char *cursor = text;
+
+    while (cursor && *cursor) {
+        char *line = cursor;
+        char *next = strchr(cursor, '\n');
+        int ret;
+
+        if (next)
+            *next++ = 0;
+        cursor = next;
+
+        line[strcspn(line, "\r")] = 0;
+        line = secure_config_skip_spaces(line);
+        if (!*line || *line == '#' || *line == ';')
+            continue;
+
+        if (!strncmp(line, "arg=", 4)) {
+            ret = secure_config_append_owned(args, line + 4);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+
+        if (!strncmp(line, "enc=", 4)) {
+            char *plain = NULL;
+
+            if (!allow_encrypted) {
+                av_log(NULL, AV_LOG_ERROR, "Nested enc= entries are not supported.\n");
+                return AVERROR(EINVAL);
+            }
+
+            ret = secure_config_decrypt(line + 4, &plain);
+            if (ret < 0)
+                return ret;
+
+            ret = secure_config_parse_text(plain, args, 0);
+            av_free(plain);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+
+        av_log(NULL, AV_LOG_ERROR,
+               "Invalid secure config line. Expected arg= or enc=.\n");
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
+static int secure_config_append_file(SecureConfigArgv *args, const char *filename)
+{
+    uint8_t *mapped = NULL;
+    char *text = NULL;
+    size_t mapped_size;
+    int ret;
+
+    ret = av_file_map(filename, &mapped, &mapped_size, 0, NULL);
+    if (ret < 0)
+        return ret;
+
+    if (mapped_size == SIZE_MAX) {
+        av_file_unmap(mapped, mapped_size);
+        return AVERROR(EINVAL);
+    }
+
+    text = av_malloc(mapped_size + 1);
+    if (!text) {
+        av_file_unmap(mapped, mapped_size);
+        return AVERROR(ENOMEM);
+    }
+
+    if (mapped_size)
+        memcpy(text, mapped, mapped_size);
+    text[mapped_size] = 0;
+    av_file_unmap(mapped, mapped_size);
+
+    ret = secure_config_parse_text(text, args, 1);
+    av_free(text);
+
+    return ret;
+}
+
+static int secure_config_expand_argv(int *argc, char ***argv, SecureConfigArgv *expanded)
+{
+    int found = 0;
+    int ret;
+
+    memset(expanded, 0, sizeof(*expanded));
+
+    for (int i = 0; i < *argc; i++) {
+        if (i > 0 && !strcmp((*argv)[i], "-secure_config")) {
+            if (found) {
+                av_log(NULL, AV_LOG_ERROR, "Only one -secure_config may be specified.\n");
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
+            if (i + 1 >= *argc) {
+                av_log(NULL, AV_LOG_ERROR, "Missing argument for -secure_config.\n");
+                ret = AVERROR(EINVAL);
+                goto fail;
+            }
+
+            found = 1;
+            ret = secure_config_append_file(expanded, (*argv)[i + 1]);
+            if (ret < 0)
+                goto fail;
+            i++;
+            continue;
+        }
+
+        ret = secure_config_append_ref(expanded, (*argv)[i]);
+        if (ret < 0)
+            goto fail;
+    }
+
+    if (found) {
+        *argc = expanded->argc;
+        *argv = expanded->argv;
+    }
+
+    return 0;
+
+fail:
+    secure_config_argv_uninit(expanded);
+    return ret;
+}
 
 static BenchmarkTimeStamps current_time;
 AVIOContext *progress_avio = NULL;
@@ -981,6 +1273,7 @@ static int64_t getmaxrss(void)
 int main(int argc, char **argv)
 {
     Scheduler *sch = NULL;
+    SecureConfigArgv secure_argv = { 0 };
 
     int ret;
     BenchmarkTimeStamps ti;
@@ -990,6 +1283,11 @@ int main(int argc, char **argv)
     setvbuf(stderr,NULL,_IONBF,0); /* win32 runtime needs this */
 
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
+
+    ret = secure_config_expand_argv(&argc, &argv, &secure_argv);
+    if (ret < 0)
+        goto finish;
+
     parse_loglevel(argc, argv, options);
 
 #if CONFIG_AVDEVICE
@@ -1053,6 +1351,8 @@ finish:
 
     av_log(NULL, AV_LOG_VERBOSE, "\n");
     av_log(NULL, AV_LOG_VERBOSE, "Exiting with exit code %d\n", ret);
+
+    secure_config_argv_uninit(&secure_argv);
 
     return ret;
 }
