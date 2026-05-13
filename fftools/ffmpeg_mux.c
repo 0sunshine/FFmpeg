@@ -568,7 +568,8 @@ int mux_check_init(void *arg)
     //assert_avoptions(of->opts);
     mux->header_written = 1;
 
-    av_dump_format(fc, of->index, fc->url, 1);
+    if (!hide_transcode_detail)
+        av_dump_format(fc, of->index, fc->url, 1);
     atomic_fetch_add(&nb_output_dumped, 1);
 
     return 0;

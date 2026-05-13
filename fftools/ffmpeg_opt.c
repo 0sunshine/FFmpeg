@@ -42,6 +42,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avutil.h"
+#include "libavutil/log.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -72,6 +73,7 @@ int exit_on_error     = 0;
 int abort_on_flags    = 0;
 int print_stats       = -1;
 int stdin_interaction = 1;
+int hide_transcode_detail = 0;
 float max_error_rate  = 2.0/3;
 char *filter_nbthreads;
 int filter_complex_nbthreads = 0;
@@ -1501,6 +1503,12 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
         goto fail;
     }
 
+    if (hide_transcode_detail) {
+        if (print_stats < 0)
+            print_stats = 1;
+        av_log_set_callback(transcode_log_callback);
+    }
+
     /* configure terminal and setup signal handlers */
     term_init();
 
@@ -1858,6 +1866,9 @@ const OptionDef options[] = {
     { "stats",               OPT_TYPE_BOOL, 0,
         { &print_stats },
         "print progress report during encoding", },
+    { "hide_transcode_detail", OPT_TYPE_BOOL, OPT_EXPERT,
+        { &hide_transcode_detail },
+        "hide stream mapping, output format and encoder detail logs", },
     { "stats_period",        OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_stats_period },
         "set the period at which ffmpeg updates stats and -progress output", "time" },

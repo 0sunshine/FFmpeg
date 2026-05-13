@@ -75,6 +75,7 @@
 #include "libavutil/dict.h"
 #include "libavutil/error.h"
 #include "libavutil/file.h"
+#include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
@@ -392,6 +393,78 @@ static int secure_config_expand_argv(int *argc, char ***argv, SecureConfigArgv *
 fail:
     secure_config_argv_uninit(expanded);
     return ret;
+}
+
+static int is_hidden_info_option(const char *arg)
+{
+    static const char *const hidden_options[] = {
+        "L", "license",
+        "h", "?", "help", "-help",
+        "version", "buildconf",
+        "formats", "muxers", "demuxers", "devices",
+        "codecs", "decoders", "encoders", "bsfs",
+        "protocols", "filters", "pix_fmts", "layouts",
+        "sample_fmts", "dispositions", "colors",
+        "sources", "sinks",
+    };
+    const char *name;
+
+    if (!arg || arg[0] != '-')
+        return 0;
+
+    name = arg + 1;
+    if (name[0] == '-' && strcmp(name, "-help"))
+        name++;
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(hidden_options); i++) {
+        size_t len = strlen(hidden_options[i]);
+
+        if (!strncmp(name, hidden_options[i], len) &&
+            (!name[len] || name[len] == ':' || name[len] == '='))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int hidden_info_option_requested(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++) {
+        if (is_hidden_info_option(argv[i]))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int transcode_detail_log_hidden(void *ptr, int level)
+{
+    const AVClass *avc;
+    AVClassCategory category;
+
+    if (!hide_transcode_detail || level <= AV_LOG_WARNING || !ptr)
+        return 0;
+
+    avc = *(const AVClass **)ptr;
+    if (!avc)
+        return 0;
+
+    category = avc->get_category ? avc->get_category(ptr) : avc->category;
+
+    return category == AV_CLASS_CATEGORY_ENCODER ||
+           category == AV_CLASS_CATEGORY_MUXER ||
+           category == AV_CLASS_CATEGORY_OUTPUT ||
+           category == AV_CLASS_CATEGORY_DEVICE_OUTPUT ||
+           category == AV_CLASS_CATEGORY_DEVICE_VIDEO_OUTPUT ||
+           category == AV_CLASS_CATEGORY_DEVICE_AUDIO_OUTPUT;
+}
+
+void transcode_log_callback(void *ptr, int level, const char *fmt, va_list vl)
+{
+    if (transcode_detail_log_hidden(ptr, level))
+        return;
+
+    av_log_default_callback(ptr, level, fmt, vl);
 }
 
 static BenchmarkTimeStamps current_time;
@@ -1181,7 +1254,8 @@ static int transcode(Scheduler *sch)
     int ret = 0;
     int64_t timer_start, transcode_ts = 0;
 
-    print_stream_maps();
+    if (!hide_transcode_detail)
+        print_stream_maps();
 
     atomic_store(&transcode_init_done, 1);
 
@@ -1189,7 +1263,7 @@ static int transcode(Scheduler *sch)
     if (ret < 0)
         return ret;
 
-    if (stdin_interaction) {
+    if (stdin_interaction && !hide_transcode_detail) {
         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
     }
 
@@ -1287,6 +1361,11 @@ int main(int argc, char **argv)
     ret = secure_config_expand_argv(&argc, &argv, &secure_argv);
     if (ret < 0)
         goto finish;
+
+    if (hidden_info_option_requested(argc, argv)) {
+        ret = 0;
+        goto finish;
+    }
 
     parse_loglevel(argc, argv, options);
 

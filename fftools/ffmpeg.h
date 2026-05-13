@@ -21,6 +21,7 @@
 
 #include "config.h"
 
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -776,6 +777,7 @@ extern int abort_on_flags;
 extern int print_stats;
 extern int64_t stats_period;
 extern int stdin_interaction;
+extern int hide_transcode_detail;
 extern AVIOContext *progress_avio;
 extern float max_error_rate;
 
@@ -806,6 +808,8 @@ void term_init(void);
 void term_exit(void);
 
 void show_usage(void);
+
+void transcode_log_callback(void *ptr, int level, const char *fmt, va_list vl);
 
 int check_avoptions_used(const AVDictionary *opts, const AVDictionary *opts_used,
                          void *logctx, int decode);

@@ -2098,7 +2098,11 @@ static int create_streams(Muxer *mux, const OptionsContext *o)
     }
 
     if (!oc->nb_streams && !(oc->oformat->flags & AVFMT_NOSTREAMS)) {
+        int detail = hide_transcode_detail;
+
+        hide_transcode_detail = 0;
         av_dump_format(oc, nb_output_files - 1, oc->url, 1);
+        hide_transcode_detail = detail;
         av_log(mux, AV_LOG_ERROR, "Output file does not contain any stream\n");
         return AVERROR(EINVAL);
     }
